@@ -1,0 +1,29 @@
+{
+    "slug": "myfirstplugin",
+    "name": "myfirstplugin",
+    "version": "2.0.0",
+    "license": "proprietary",
+    "brand": "DEVELOPMENT",
+    "author": "deadactive",
+    "authorEmail": "",
+    "authorUrl": "",
+    "pluginUrl": "",
+    "manualUrl": "",
+    "sourceUrl": "",
+    "donateUrl": "",
+    "changelogUrl": "",
+    "modules": [
+        {
+            "slug": "BlankPanel",
+            "name": "blank.",
+            "description": "4hp blank panel",
+            "tags": ["blank"]
+        },
+        {
+            "slug": "Push",
+            "name": "push.",
+            "description": "push module clone",
+            "tags": ["utility"]
+        }
+    ]
+}

@@ -7,6 +7,5 @@ void init(Plugin* p) {
 	pluginInstance = p;
 
 	// Add modules here
-	p->addModel(modelBlankPanel);
-	p->addModel(modelPush);
+	p->addModel(modelSlicer);
 }

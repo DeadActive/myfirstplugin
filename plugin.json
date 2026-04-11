@@ -14,16 +14,10 @@
     "changelogUrl": "",
     "modules": [
         {
-            "slug": "BlankPanel",
-            "name": "blank.",
-            "description": "4hp blank panel",
-            "tags": ["blank"]
-        },
-        {
-            "slug": "Push",
-            "name": "push.",
-            "description": "push module clone",
-            "tags": ["utility"]
+            "slug": "Slicer",
+            "name": "Slicer",
+            "description": "Compact beat repeat/glitch engine inspired by 2HP Slicer",
+            "tags": ["Digital", "Delay", "Effect", "Recording", "Hardware clone"]
         }
     ]
 }

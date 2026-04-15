@@ -8,8 +8,21 @@ set -e
 PLUGIN_ROOT="$(cd "$(dirname "$0")" && pwd)"
 RACK_DIR="${RACK_DIR:-/Users/evech/Desktop/dev/Fundamental/Rack-SDK}"
 APP_NAME="/Applications/VCV Rack 2 Free.app"
+# Run this binary so Rack's stdout/stderr appear in this terminal (open -a hides them).
+RACK_EXECUTABLE="${RACK_EXECUTABLE:-$APP_NAME/Contents/MacOS/Rack}"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
+
+launch_rack() {
+  if [[ -x "$RACK_EXECUTABLE" ]]; then
+    # Background so fswatch keeps running; inherit terminal for stdout/stderr.
+    "$RACK_EXECUTABLE" 2>&1 &
+  else
+    log "Rack executable not found or not executable: $RACK_EXECUTABLE"
+    log "Falling back to open (no console output from Rack)."
+    open -a "$APP_NAME"
+  fi
+}
 
 run_install_and_restart() {
   log "Change detected, running make install..."
@@ -21,8 +34,8 @@ run_install_and_restart() {
   pids=($(pgrep -f "VCV Rack" 2>/dev/null || true))
   if [[ ${#pids[@]} -eq 0 ]]; then
     log "No running 'VCV Rack' process found; skipping restart."
-    log "Launching $APP_NAME"
-    open -a "$APP_NAME"
+    log "Launching Rack ($RACK_EXECUTABLE)"
+    launch_rack
     log "Done."
     return 0
   fi
@@ -36,8 +49,8 @@ run_install_and_restart() {
   for pid in $pids; do
     kill -9 "$pid" 2>/dev/null || true
   done
-  log "Launching $APP_NAME"
-  open -a "$APP_NAME"
+  log "Launching Rack ($RACK_EXECUTABLE)"
+  launch_rack
   log "Done."
 }
 

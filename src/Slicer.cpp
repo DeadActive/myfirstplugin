@@ -27,32 +27,31 @@ struct Slicer : Module {
 
 	constexpr static int MIN_BPM = 10;
 
-	enum SampleRateMode {
-		SAMPLE_RATE_HIFI,
-		SAMPLE_RATE_LOFI,
+	enum PPQMode {
+		PPQ_MODE_1 = 1,
+		PPQ_MODE_2 = 2,
+		PPQ_MODE_4 = 4,
+		PPQ_MODE_8 = 8,
+		PPQ_MODE_12 = 12,
+		PPQ_MODE_16 = 16,
+		PPQ_MODE_24 = 24,
 	};
 
-	SampleRateMode sampleRateMode = SAMPLE_RATE_HIFI;
+	PPQMode ppqMode = PPQ_MODE_1;
 
-	float getSampleRateHz() const {
-		return sampleRateMode == SAMPLE_RATE_LOFI ? 22050.f : 44100.f;
+	float getPPQLength() const {
+		return ppqMode * 4.f;
 	}
 
-	constexpr static size_t BUFFER_SIZE = (44100 * 60) / MIN_BPM;
+	constexpr static size_t BUFFER_SIZE = (48000 * 60) / MIN_BPM * 8;
 
 	dsp::DoubleRingBuffer<float, BUFFER_SIZE> historyBuffer;
 	dsp::BooleanTrigger clkTrigger;
 
 	bool last_gate = false;
-	bool last_trig = false;
 
 	uint32_t writePos = 0;
 	uint32_t readPos = 0;
-
-	/** Ring index of the sample written on gate rise (inclusive start of the slice). */
-	uint32_t recordStart = 0;
-	/** Samples elapsed since gate rise (including gate sample), incremented while waiting for clock. */
-	uint32_t samplesSinceGate = 0;
 
 	uint32_t baseLength = 0;
 	uint32_t loopStart = 0;
@@ -80,55 +79,21 @@ struct Slicer : Module {
 		configInput(IN__INPUT, "Audio In");
 		configInput(CLK__INPUT, "Clock");
 		configInput(TRIG__INPUT, "Trigger CV");
-		configInput(SIZE__INPUT, "Size CV");
+		configInput(SIZE__INPUT, "Size CV (-5V to +5V)");
 		configOutput(OUT__OUTPUT, "Audio Out");
 		configLight(TRIG__LIGHT, "Trigger");
 	}
 
-	void computeLoopLengthFromParams() {
-		uint32_t baseLen = lastIntervalLength;
-		if (baseLen == 0) {
-			baseLen = samplesSinceLastClk;
-			if (baseLen == 0)
-				baseLen = 1;
-		}
-		baseLength = baseLen;
-
+	float getLoopLength() {
+		baseLength = lastIntervalLength;
 		bool isSizeCVConnected = inputs[SIZE__INPUT].isConnected();
 		float sizeCV = isSizeCVConnected ? clamp(inputs[SIZE__INPUT].getVoltage(), -10.f, 10.f) * 0.1f + 0.5f : 0.f;
 		float size = isSizeCVConnected ? sizeCV * numSizeOptions : params[SIZE__PARAM].getValue();
-		loopLength = baseLength * getSizeBarFraction(size) * 4.f;
-
-		if (params[TRIPLE__PARAM].getValue() > 0.f) {
-			loopLength *= (2.f / 3.f);
-		}
-		loopLength = clamp(loopLength, 1, BUFFER_SIZE);
-	}
-
-	/** Forward from gate: length min(param, samples recorded until clock). */
-	void beginRepeatFromRecordStart(uint32_t samplesRecorded) {
-		computeLoopLengthFromParams();
-
-		uint32_t effectiveLen = loopLength;
-		if (effectiveLen > samplesRecorded)
-			effectiveLen = samplesRecorded;
-		if (effectiveLen < 1)
-			effectiveLen = 1;
-
-		loopStart = recordStart;
-		loopEnd = (loopStart + effectiveLen) % BUFFER_SIZE;
-
-		readPos = loopStart;
-	}
-
-	/** Instant CV path: slice ends at current write cursor, length from params (past buffer only). */
-	void beginRepeatBackwardFromWritePos() {
-		computeLoopLengthFromParams();
-
-		loopEnd = writePos;
-		loopStart = (loopEnd + BUFFER_SIZE - loopLength) % BUFFER_SIZE;
-
-		readPos = loopStart;
+		loopLength = baseLength * getSizeBarFraction(size) * getPPQLength();
+				if(params[TRIPLE__PARAM].getValue() > 0.f) {
+					loopLength *= (2.f / 3.f);
+				}
+				return clamp(loopLength, 1, BUFFER_SIZE);
 	}
 
 	void process(const ProcessArgs& args) override {
@@ -149,35 +114,28 @@ struct Slicer : Module {
 			samplesSinceLastClk = 0;
 		}
 
-		// GATE — record start on rise; button waits for clock. TRIG input rising skips wait and repeats immediately (backward slice).
+		// GATE
 		bool push = params[TRIG__PARAM].getValue() > 0.f;
-		bool trigIn = inputs[TRIG__INPUT].isConnected();
-		bool trigHigh = trigIn && inputs[TRIG__INPUT].getVoltage() > 0.f;
-		bool gate = push || trigHigh;
+		bool trig = inputs[TRIG__INPUT].isConnected() && inputs[TRIG__INPUT].getVoltage() > 0.f;
+		bool gate = push || trig;
 
-		bool trigRising = trigIn && trigHigh && !last_trig;
 		bool gateRising = gate && !last_gate;
 		bool gateFalling = !gate && last_gate;
 
-		if (trigRising) {
-			recordStart = (writePos + BUFFER_SIZE - 1) % BUFFER_SIZE;
-			beginRepeatBackwardFromWritePos();
-			state = REPEATING;
-		} else if (gateRising) {
-			recordStart = (writePos + BUFFER_SIZE - 1) % BUFFER_SIZE;
-			samplesSinceGate = 0;
+		if(gateRising) {
 			state = WAIT_FOR_CLOCK;
 		}
-
-		if (gateFalling) {
+		if(gateFalling) {
 			state = IDLE;
 		}
 
-		if (state == WAIT_FOR_CLOCK)
-			samplesSinceGate++;
+		if(state == WAIT_FOR_CLOCK && clk) {
+			loopLength = getLoopLength();
 
-		if (state == WAIT_FOR_CLOCK && clk) {
-			beginRepeatFromRecordStart(samplesSinceGate);
+			loopStart = writePos;
+			loopEnd = (loopStart + loopLength) % BUFFER_SIZE;
+			
+			readPos = loopStart;
 			state = REPEATING;
 		}
 
@@ -192,6 +150,9 @@ struct Slicer : Module {
 			}
 
 			if(readPos == loopEnd) {
+				loopLength = getLoopLength();
+				loopEnd = (loopStart + loopLength) % BUFFER_SIZE;
+
 				readPos = loopStart;
 			}
 		} else {
@@ -200,7 +161,6 @@ struct Slicer : Module {
 			}
 		}
 
-		last_trig = trigHigh;
 		last_gate = gate;
 
 		// AUDIO OUTPUT
@@ -225,16 +185,16 @@ struct Slicer : Module {
 
 	json_t* dataToJson() override {
 		json_t* rootJ = json_object();
-		json_object_set_new(rootJ, "sampleRateMode", json_integer(sampleRateMode));
+		json_object_set_new(rootJ, "ppqMode", json_integer(ppqMode));
 		return rootJ;
 	}
 
 	void dataFromJson(json_t* rootJ) override {
-		json_t* modeJ = json_object_get(rootJ, "sampleRateMode");
-		if (modeJ) {
-			int v = json_integer_value(modeJ);
-			if (v == SAMPLE_RATE_HIFI || v == SAMPLE_RATE_LOFI)
-				sampleRateMode = (SampleRateMode)v;
+		json_t* ppqJ = json_object_get(rootJ, "ppqMode");
+		if (ppqJ) {
+			int v = json_integer_value(ppqJ);
+			if (v == PPQ_MODE_1 || v == PPQ_MODE_4)
+				ppqMode = (PPQMode)v;
 		}
 	}
 };
@@ -262,30 +222,70 @@ struct SlicerWidget : ModuleWidget {
 		addChild(createLightCentered<MediumLight<RedGreenBlueLight>>(mm2px(Vec(4.97, 52.177)), module, Slicer::TRIG__LIGHT));
 	}
 
-	struct HiFiOption : MenuItem {
+	struct PPQ1Option : MenuItem {
 		Slicer* module;
 		void onAction(const event::Action& e) override {
-			module->sampleRateMode = Slicer::SAMPLE_RATE_HIFI;
+			module->ppqMode = Slicer::PPQ_MODE_1;
 		}
 	};
 
-	struct LoFiOption : MenuItem {
+	struct PPQ2Option : MenuItem {
 		Slicer* module;
 		void onAction(const event::Action& e) override {
-			module->sampleRateMode = Slicer::SAMPLE_RATE_LOFI;
+			module->ppqMode = Slicer::PPQ_MODE_2;
 		}
 	};
 
-	struct SampleRateMenu : MenuItem {
+	struct PPQ4Option : MenuItem {
+		Slicer* module;
+		void onAction(const event::Action& e) override {
+			module->ppqMode = Slicer::PPQ_MODE_4;
+		}
+	};
+
+	struct PPQ8Option : MenuItem {
+		Slicer* module;
+		void onAction(const event::Action& e) override {
+			module->ppqMode = Slicer::PPQ_MODE_8;
+		}
+	};
+
+	struct PPQ16Option : MenuItem {
+		Slicer* module;
+		void onAction(const event::Action& e) override {
+			module->ppqMode = Slicer::PPQ_MODE_16;
+		}
+	};
+
+	struct PPQ24Option : MenuItem {
+		Slicer* module;
+		void onAction(const event::Action& e) override {
+			module->ppqMode = Slicer::PPQ_MODE_24;
+		}
+	};
+
+	struct PPQMenu : MenuItem {
 		Slicer* module;
 		Menu* createChildMenu() override {
 			Menu* menu = new Menu;
-			HiFiOption* hifi = createMenuItem<HiFiOption>("HiFi (44.1 kHz)", CHECKMARK(module->sampleRateMode == Slicer::SAMPLE_RATE_HIFI));
-			hifi->module = module;
-			menu->addChild(hifi);
-			LoFiOption* lofi = createMenuItem<LoFiOption>("LoFi (22.05 kHz)", CHECKMARK(module->sampleRateMode == Slicer::SAMPLE_RATE_LOFI));
-			lofi->module = module;
-			menu->addChild(lofi);
+			PPQ1Option* ppq1 = createMenuItem<PPQ1Option>("1", CHECKMARK(module->ppqMode == Slicer::PPQ_MODE_1));
+			ppq1->module = module;
+			menu->addChild(ppq1);
+			PPQ2Option* ppq2 = createMenuItem<PPQ2Option>("2", CHECKMARK(module->ppqMode == Slicer::PPQ_MODE_2));
+			ppq2->module = module;
+			menu->addChild(ppq2);
+			PPQ4Option* ppq4 = createMenuItem<PPQ4Option>("4", CHECKMARK(module->ppqMode == Slicer::PPQ_MODE_4));
+			ppq4->module = module;
+			menu->addChild(ppq4);
+			PPQ8Option* ppq8 = createMenuItem<PPQ8Option>("8", CHECKMARK(module->ppqMode == Slicer::PPQ_MODE_8));
+			ppq8->module = module;
+			menu->addChild(ppq8);
+			PPQ16Option* ppq16 = createMenuItem<PPQ16Option>("16", CHECKMARK(module->ppqMode == Slicer::PPQ_MODE_16));
+			ppq16->module = module;
+			menu->addChild(ppq16);
+			PPQ24Option* ppq24 = createMenuItem<PPQ24Option>("24", CHECKMARK(module->ppqMode == Slicer::PPQ_MODE_24));
+			ppq24->module = module;
+			menu->addChild(ppq24);
 			return menu;
 		}
 	};
@@ -293,10 +293,11 @@ struct SlicerWidget : ModuleWidget {
 	void appendContextMenu(Menu* menu) override {
 		Slicer* module = dynamic_cast<Slicer*>(this->module);
 		assert(module);
+
 		menu->addChild(new MenuEntry);
-		SampleRateMenu* sampleRateMenu = createMenuItem<SampleRateMenu>("Sample rate", RIGHT_ARROW);
-		sampleRateMenu->module = module;
-		menu->addChild(sampleRateMenu);
+		PPQMenu* ppqMenu = createMenuItem<PPQMenu>("PPQN", RIGHT_ARROW);
+		ppqMenu->module = module;
+		menu->addChild(ppqMenu);
 	}
 };
 

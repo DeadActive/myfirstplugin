@@ -1,8 +1,9 @@
 #include <cassert>
+#include <cmath>
 
 #include "plugin.hpp"
 
-struct Slicer : Module {
+struct Slice : Module {
 	enum ParamId {
 		TRIG__PARAM,
 		TRIPLE__PARAM,
@@ -26,32 +27,28 @@ struct Slicer : Module {
 	};
 
 	constexpr static int MIN_BPM = 10;
+	constexpr static float DECLICK_TIME = 0.0025f;
 
-	enum PPQMode {
-		PPQ_MODE_1 = 1,
-		PPQ_MODE_2 = 2,
-		PPQ_MODE_4 = 4,
-		PPQ_MODE_8 = 8,
-		PPQ_MODE_12 = 12,
-		PPQ_MODE_16 = 16,
-		PPQ_MODE_24 = 24,
+	enum GateSyncMode {
+		GATE_SYNC_MODE_OFF = 0,
+		GATE_SYNC_MODE_ON = 1,
 	};
 
-	PPQMode ppqMode = PPQ_MODE_1;
-
-	float getPPQLength() const {
-		return ppqMode * 4.f;
-	}
+	GateSyncMode gateSyncMode = GATE_SYNC_MODE_OFF;
 
 	constexpr static size_t BUFFER_SIZE = (48000 * 60) / MIN_BPM * 8;
 
-	dsp::DoubleRingBuffer<float, BUFFER_SIZE> historyBuffer;
-	dsp::BooleanTrigger clkTrigger;
+	dsp::RingBuffer<float, BUFFER_SIZE> historyBuffer;
+	dsp::SchmittTrigger clkTrigger;
+	dsp::ClockDivider clockDivider;
+
+	dsp::PulseGenerator clockPulse;
 
 	bool last_gate = false;
-
 	uint32_t writePos = 0;
 	uint32_t readPos = 0;
+	uint32_t declickPos = 1;
+	uint32_t declickLength = 1;
 
 	uint32_t baseLength = 0;
 	uint32_t loopStart = 0;
@@ -59,7 +56,20 @@ struct Slicer : Module {
 	uint32_t loopLength = 0;
 
 	uint32_t samplesSinceLastClk = 0;
-	uint32_t lastIntervalLength = 0;
+	uint32_t lastIntervalLength = bpmToSamples(120, 48000);
+
+	float lastSize = 0.f;
+	float lastOut = 0.f;
+	float lastRawPlay = 0.f;
+
+	enum DeclickReason : uint8_t {
+		DECLICK_NONE = 0,
+		DECLICK_GATE_ON,
+		DECLICK_GATE_OFF,
+		DECLICK_LOOP_WRAP,
+	};
+	DeclickReason declickReason = DECLICK_NONE;
+	float declickTail = 0.f;
 
 	enum State {
 		IDLE,
@@ -68,238 +78,255 @@ struct Slicer : Module {
 	};
 	State state = IDLE;
 
-	Slicer() {
+	Slice() {
 		config(PARAMS_LEN, INPUTS_LEN, OUTPUTS_LEN, LIGHTS_LEN);
 		configButton(TRIG__PARAM, "Trigger");
 		configSwitch(TRIPLE__PARAM, 0.f, 1.f, 0.f, "Triplet", {"Off", "On"});
 
-		configParam<SizeParam>(SIZE__PARAM, 0.f, (float)(numSizeOptions - 1), 1.f, "Size");
+		configParam<SizeParam>(SIZE__PARAM, 0.f, (float)(numSizeOptions - 1), 6.f, "Size");
 		paramQuantities[SIZE__PARAM]->snapEnabled = true;
 
 		configInput(IN__INPUT, "Audio In");
 		configInput(CLK__INPUT, "Clock");
 		configInput(TRIG__INPUT, "Trigger CV");
-		configInput(SIZE__INPUT, "Size CV (-5V to +5V)");
+		configInput(SIZE__INPUT, "Size CV (-10V to +10V)");
 		configOutput(OUT__OUTPUT, "Audio Out");
 		configLight(TRIG__LIGHT, "Trigger");
+
+		clockDivider.setDivision(lastIntervalLength);
 	}
 
 	float getLoopLength() {
 		baseLength = lastIntervalLength;
-		bool isSizeCVConnected = inputs[SIZE__INPUT].isConnected();
-		float sizeCV = isSizeCVConnected ? clamp(inputs[SIZE__INPUT].getVoltage(), -10.f, 10.f) * 0.1f + 0.5f : 0.f;
-		float size = isSizeCVConnected ? sizeCV * numSizeOptions : params[SIZE__PARAM].getValue();
-		loopLength = baseLength * getSizeBarFraction(size) * getPPQLength();
-				if(params[TRIPLE__PARAM].getValue() > 0.f) {
-					loopLength *= (2.f / 3.f);
-				}
-				return clamp(loopLength, 1, BUFFER_SIZE);
+		float size = 0.f;
+		if(inputs[SIZE__INPUT].isConnected()) {
+			float sizeCV = (clamp(inputs[SIZE__INPUT].getVoltage(), -10.f, 10.f) + 10.f) / 20.f;
+			size = sizeCV * (numSizeOptions - 1);
+		} else {
+			size = params[SIZE__PARAM].getValue();
+		}
+		loopLength = baseLength * getSizeBarFraction(size, params[TRIPLE__PARAM].getValue() > 0.f) * 4.f;
+		return clamp(loopLength, 1, BUFFER_SIZE);
+	}
+
+	void startDeclick(float sampleRate, DeclickReason reason, float tailSample = 0.f) {
+		declickReason = reason;
+		if(reason == DECLICK_GATE_OFF || reason == DECLICK_LOOP_WRAP)
+			declickTail = tailSample;
+		uint32_t fadeSamples = (uint32_t) (sampleRate * DECLICK_TIME + 0.5f);
+		declickLength = fadeSamples > 0 ? fadeSamples : 1;
+		declickPos = 0;
+	}
+
+	float applyDeclick(float live, float rawPlay) {
+		if(declickReason == DECLICK_NONE || declickPos >= declickLength) {
+			declickReason = DECLICK_NONE;
+			return rawPlay;
+		}
+
+		float t = (float) (declickPos + 1) / (float) declickLength;
+		float c = std::cos(0.5f * static_cast<float>(M_PI) * t);
+		float s = std::sin(0.5f * static_cast<float>(M_PI) * t);
+		declickPos++;
+		float y = rawPlay;
+		switch(declickReason) {
+			case DECLICK_GATE_ON:
+				y = live * c + rawPlay * s;
+				break;
+			case DECLICK_GATE_OFF:
+				y = declickTail * c + live * s;
+				break;
+			case DECLICK_LOOP_WRAP:
+				y = declickTail * c + rawPlay * s;
+				break;
+			default:
+				break;
+		}
+		if(declickPos >= declickLength)
+			declickReason = DECLICK_NONE;
+		return y;
+	}
+
+	void setLight(float colors[3], bool smooth = false, float time = 0.f ) {
+		if(smooth) {
+			lights[TRIG__LIGHT].setBrightnessSmooth(colors[0], time, 60.f);
+			lights[TRIG__LIGHT + 1].setBrightnessSmooth(colors[1], time, 60.f);
+			lights[TRIG__LIGHT + 2].setBrightnessSmooth(colors[2], time, 60.f);
+		} else {
+			lights[TRIG__LIGHT].setBrightness(colors[0]);
+			lights[TRIG__LIGHT + 1].setBrightness(colors[1]);
+			lights[TRIG__LIGHT + 2].setBrightness(colors[2]);
+		}
 	}
 
 	void process(const ProcessArgs& args) override {
 		// WRITE TO BUFFER
 		if (inputs[IN__INPUT].isConnected()) {
 			float in = inputs[IN__INPUT].getVoltageSum();
-			if (historyBuffer.full())
-				historyBuffer.shift();
 			historyBuffer.push(in);
-			writePos = (writePos + 1) % BUFFER_SIZE;
 		}
 
-		// CLOCK
-		bool clk = clkTrigger.process(inputs[CLK__INPUT].getVoltage() > 0.f);
+		bool clk = clockDivider.process();
+
 		samplesSinceLastClk++;
-		if(clk) {
-			lastIntervalLength = samplesSinceLastClk;
-			samplesSinceLastClk = 0;
+		if(inputs[CLK__INPUT].isConnected()) {
+			bool clkIn = clkTrigger.process(inputs[CLK__INPUT].getVoltage());
+			clk = clkIn;
+			if(clkIn) {
+				lastIntervalLength = samplesSinceLastClk;
+				clockDivider.reset();
+				clockDivider.setDivision(lastIntervalLength);
+				samplesSinceLastClk = 0;
+			}
 		}
 
 		// GATE
-		bool push = params[TRIG__PARAM].getValue() > 0.f;
-		bool trig = inputs[TRIG__INPUT].isConnected() && inputs[TRIG__INPUT].getVoltage() > 0.f;
+		bool push = params[TRIG__PARAM].getValue() > .1f;
+		bool trig = inputs[TRIG__INPUT].isConnected() && inputs[TRIG__INPUT].getVoltage() > 0.1f;
 		bool gate = push || trig;
 
 		bool gateRising = gate && !last_gate;
 		bool gateFalling = !gate && last_gate;
 
+		last_gate = gate;
+
 		if(gateRising) {
-			state = WAIT_FOR_CLOCK;
+			state = REPEATING;
+			startDeclick(args.sampleRate, DECLICK_GATE_ON);
+
+			loopStart = writePos;
+			readPos = loopStart;
 		}
 		if(gateFalling) {
 			state = IDLE;
+			startDeclick(args.sampleRate, DECLICK_GATE_OFF, lastRawPlay);
+
+			loopStart = 0;
+			loopEnd = 0;
+			loopLength = 0;
+			readPos = 0;
 		}
 
-		if(state == WAIT_FOR_CLOCK && clk) {
-			loopLength = getLoopLength();
+		loopLength = getLoopLength();
+		loopEnd = (loopStart + loopLength) % BUFFER_SIZE;
 
-			loopStart = writePos;
-			loopEnd = (loopStart + loopLength) % BUFFER_SIZE;
-			
-			readPos = loopStart;
-			state = REPEATING;
-		}
-
-		float out = 0.f;
-
+		float live = inputs[IN__INPUT].getVoltageSum();
+		float rawPlay = live;
 		if(state == REPEATING) {
-			out = historyBuffer.data[readPos];
-			readPos++;
+			rawPlay = historyBuffer.data[readPos];
+			readPos = (readPos + 1) % BUFFER_SIZE;
 
-			if(readPos >= BUFFER_SIZE) {
-				readPos = 0;
-			}
-
-			if(readPos == loopEnd) {
-				loopLength = getLoopLength();
-				loopEnd = (loopStart + loopLength) % BUFFER_SIZE;
-
+			if(readPos >= loopEnd) {
+				uint32_t lastIdx = (loopEnd + BUFFER_SIZE - 1) % BUFFER_SIZE;
+				float loopTailSample = historyBuffer.data[lastIdx];
 				readPos = loopStart;
+				startDeclick(args.sampleRate, DECLICK_LOOP_WRAP, loopTailSample);
 			}
-		} else {
-			if(inputs[IN__INPUT].isConnected()) {
-				out = inputs[IN__INPUT].getVoltageSum();
-			}
+			lastRawPlay = rawPlay;
 		}
-
-		last_gate = gate;
 
 		// AUDIO OUTPUT
+		float out = applyDeclick(live, rawPlay);
 		outputs[OUT__OUTPUT].setVoltage(out);
+		lastOut = out;
 
 		// SET LIGHT
-		float colors[3] = {0.f, 0.f, 0.f};
-
-		if(state == WAIT_FOR_CLOCK) {
-			colors[2] = 1.f;
-		} else if(state == REPEATING) {
-			colors[0] = 1.f;
-			colors[2] = 1.f;
-		} else if (clk) {
-			colors[1] = 1.f;
+		if(clk) {clockPulse.trigger(0.1f);}
+		if(clockPulse.process(args.sampleTime)) {
+			float colors[3] = {0.f, 1.f, 0.f};
+			setLight(colors, true, args.sampleTime);
+		} else if (state == REPEATING) {
+			float colors[3] = {1.f, 0.f, 1.f};
+			setLight(colors);
+		} else {
+			float colors[3] = {0.f, 0.f, 0.f};
+			setLight(colors);
 		}
 
-		lights[TRIG__LIGHT].setBrightnessSmooth(colors[0], args.sampleTime);
-		lights[TRIG__LIGHT + 1].setBrightnessSmooth(colors[1], args.sampleTime);
-		lights[TRIG__LIGHT + 2].setBrightnessSmooth(colors[2], args.sampleTime);
+		if(inputs[IN__INPUT].isConnected()) {
+			writePos = (writePos + 1) % BUFFER_SIZE;
+		}
+
 	}
 
 	json_t* dataToJson() override {
 		json_t* rootJ = json_object();
-		json_object_set_new(rootJ, "ppqMode", json_integer(ppqMode));
+		json_object_set_new(rootJ, "gateSyncMode", json_integer(gateSyncMode));
 		return rootJ;
 	}
 
 	void dataFromJson(json_t* rootJ) override {
-		json_t* ppqJ = json_object_get(rootJ, "ppqMode");
-		if (ppqJ) {
-			int v = json_integer_value(ppqJ);
-			if (v == PPQ_MODE_1 || v == PPQ_MODE_4)
-				ppqMode = (PPQMode)v;
+		json_t* gateSyncModeJ = json_object_get(rootJ, "gateSyncMode");
+		if (gateSyncModeJ) {
+			int v = json_integer_value(gateSyncModeJ);
+			if (v == GATE_SYNC_MODE_OFF || v == GATE_SYNC_MODE_ON)
+				gateSyncMode = (GateSyncMode)v;
 		}
 	}
 };
 
 
-struct SlicerWidget : ModuleWidget {
-	SlicerWidget(Slicer* module) {
+struct SliceWidget : ModuleWidget {
+	SliceWidget(Slice* module) {
 		setModule(module);
 		setPanel(createPanel(asset::plugin(pluginInstance, "res/Slicer.svg")));
 
 		addChild(createWidget<ThemedScrew>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, 0)));
 		addChild(createWidget<ThemedScrew>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
 
-		addParam(createParamCentered<VCVButton>(mm2px(Vec(4.97, 60.133)), module, Slicer::TRIG__PARAM));
-		addParam(createParamCentered<CKSS>(mm2px(Vec(4.97, 72.112)), module, Slicer::TRIPLE__PARAM));
-		addParam(createParamCentered<RoundSmallBlackKnob>(mm2px(Vec(4.97, 87.034)), module, Slicer::SIZE__PARAM));
+		addParam(createParamCentered<VCVButton>(mm2px(Vec(4.97, 60.133)), module, Slice::TRIG__PARAM));
+		addParam(createParamCentered<CKSS>(mm2px(Vec(4.97, 72.112)), module, Slice::TRIPLE__PARAM));
+		addParam(createParamCentered<RoundSmallBlackKnob>(mm2px(Vec(4.97, 87.034)), module, Slice::SIZE__PARAM));
 
-		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(4.97, 15.596)), module, Slicer::IN__INPUT));
-		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(4.97, 30.571)), module, Slicer::CLK__INPUT));
-		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(4.97, 43.521)), module, Slicer::TRIG__INPUT));
-		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(4.97, 101.21)), module, Slicer::SIZE__INPUT));
+		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(4.97, 15.596)), module, Slice::IN__INPUT));
+		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(4.97, 30.571)), module, Slice::CLK__INPUT));
+		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(4.97, 43.521)), module, Slice::TRIG__INPUT));
+		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(4.97, 101.21)), module, Slice::SIZE__INPUT));
 
-		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(4.97, 116.019)), module, Slicer::OUT__OUTPUT));
+		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(4.97, 116.019)), module, Slice::OUT__OUTPUT));
 
-		addChild(createLightCentered<MediumLight<RedGreenBlueLight>>(mm2px(Vec(4.97, 52.177)), module, Slicer::TRIG__LIGHT));
+		addChild(createLightCentered<MediumLight<RedGreenBlueLight>>(mm2px(Vec(4.97, 52.177)), module, Slice::TRIG__LIGHT));
 	}
 
-	struct PPQ1Option : MenuItem {
-		Slicer* module;
+	struct GateSyncModeOffOption : MenuItem {
+		Slice* module;
 		void onAction(const event::Action& e) override {
-			module->ppqMode = Slicer::PPQ_MODE_1;
+			module->gateSyncMode = Slice::GATE_SYNC_MODE_OFF;
 		}
 	};
 
-	struct PPQ2Option : MenuItem {
-		Slicer* module;
+	struct GateSyncModeOnOption : MenuItem {
+		Slice* module;
 		void onAction(const event::Action& e) override {
-			module->ppqMode = Slicer::PPQ_MODE_2;
+			module->gateSyncMode = Slice::GATE_SYNC_MODE_ON;
 		}
 	};
 
-	struct PPQ4Option : MenuItem {
-		Slicer* module;
-		void onAction(const event::Action& e) override {
-			module->ppqMode = Slicer::PPQ_MODE_4;
-		}
-	};
-
-	struct PPQ8Option : MenuItem {
-		Slicer* module;
-		void onAction(const event::Action& e) override {
-			module->ppqMode = Slicer::PPQ_MODE_8;
-		}
-	};
-
-	struct PPQ16Option : MenuItem {
-		Slicer* module;
-		void onAction(const event::Action& e) override {
-			module->ppqMode = Slicer::PPQ_MODE_16;
-		}
-	};
-
-	struct PPQ24Option : MenuItem {
-		Slicer* module;
-		void onAction(const event::Action& e) override {
-			module->ppqMode = Slicer::PPQ_MODE_24;
-		}
-	};
-
-	struct PPQMenu : MenuItem {
-		Slicer* module;
+	struct GateSyncModeMenu : MenuItem {
+		Slice* module;
 		Menu* createChildMenu() override {
 			Menu* menu = new Menu;
-			PPQ1Option* ppq1 = createMenuItem<PPQ1Option>("1", CHECKMARK(module->ppqMode == Slicer::PPQ_MODE_1));
-			ppq1->module = module;
-			menu->addChild(ppq1);
-			PPQ2Option* ppq2 = createMenuItem<PPQ2Option>("2", CHECKMARK(module->ppqMode == Slicer::PPQ_MODE_2));
-			ppq2->module = module;
-			menu->addChild(ppq2);
-			PPQ4Option* ppq4 = createMenuItem<PPQ4Option>("4", CHECKMARK(module->ppqMode == Slicer::PPQ_MODE_4));
-			ppq4->module = module;
-			menu->addChild(ppq4);
-			PPQ8Option* ppq8 = createMenuItem<PPQ8Option>("8", CHECKMARK(module->ppqMode == Slicer::PPQ_MODE_8));
-			ppq8->module = module;
-			menu->addChild(ppq8);
-			PPQ16Option* ppq16 = createMenuItem<PPQ16Option>("16", CHECKMARK(module->ppqMode == Slicer::PPQ_MODE_16));
-			ppq16->module = module;
-			menu->addChild(ppq16);
-			PPQ24Option* ppq24 = createMenuItem<PPQ24Option>("24", CHECKMARK(module->ppqMode == Slicer::PPQ_MODE_24));
-			ppq24->module = module;
-			menu->addChild(ppq24);
+			GateSyncModeOffOption* gateSyncModeOff = createMenuItem<GateSyncModeOffOption>("Off", CHECKMARK(module->gateSyncMode == Slice::GATE_SYNC_MODE_OFF));
+			gateSyncModeOff->module = module;
+			menu->addChild(gateSyncModeOff);
+			GateSyncModeOnOption* gateSyncModeOn = createMenuItem<GateSyncModeOnOption>("On", CHECKMARK(module->gateSyncMode == Slice::GATE_SYNC_MODE_ON));
+			gateSyncModeOn->module = module;
+			menu->addChild(gateSyncModeOn);
 			return menu;
 		}
 	};
 
 	void appendContextMenu(Menu* menu) override {
-		Slicer* module = dynamic_cast<Slicer*>(this->module);
+		Slice* module = dynamic_cast<Slice*>(this->module);
 		assert(module);
 
 		menu->addChild(new MenuEntry);
-		PPQMenu* ppqMenu = createMenuItem<PPQMenu>("PPQN", RIGHT_ARROW);
-		ppqMenu->module = module;
-		menu->addChild(ppqMenu);
+
+		GateSyncModeMenu* gateSyncModeMenu = createMenuItem<GateSyncModeMenu>("Sync to clock", RIGHT_ARROW);
+		gateSyncModeMenu->module = module;
+		menu->addChild(gateSyncModeMenu);
 	}
 };
 
 
-Model* modelSlicer = createModel<Slicer, SlicerWidget>("Slicer");
+Model* modelSlice = createModel<Slice, SliceWidget>("Slice");
